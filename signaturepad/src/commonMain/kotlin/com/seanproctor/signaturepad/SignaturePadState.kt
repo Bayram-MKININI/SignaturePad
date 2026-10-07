@@ -4,17 +4,11 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.Saver
 import androidx.compose.runtime.saveable.listSaver
 import androidx.compose.runtime.saveable.rememberSaveable
-import androidx.compose.runtime.snapshots.Snapshot
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Canvas
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
-import androidx.compose.ui.graphics.Paint
-import androidx.compose.ui.graphics.PaintingStyle
-import androidx.compose.ui.graphics.StrokeCap
-import androidx.compose.ui.graphics.StrokeJoin
-import kotlin.math.min
 
 /**
  * State holder for a [SignaturePad] composable. Tracks gesture input, accumulated bezier curves,
@@ -23,6 +17,13 @@ import kotlin.math.min
 public interface SignaturePadState {
     /** Observable state that is `true` once the user has begun signing. Reset by [clear]. */
     public val signatureStarted: State<Boolean>
+
+    /**
+     * The finished strokes, without the stroke in progress. Holds a new [Signature] each time a stroke
+     * ends and each time the signature is cleared, resized or restored, so reading it in composition
+     * or in `snapshotFlow` sees every change. An implementation that doesn't override it stays empty.
+     */
+    public val signature: Signature get() = Signature.Empty
 
     /** Called when a new drag gesture begins at the given [point]. Resets the current stroke. */
     public fun gestureStarted(point: Offset)
@@ -73,6 +74,12 @@ public class SignaturePadStateImpl(
     private var gestureActive = false
     private val beziers = mutableStateListOf<Bezier>()
 
+    // The curves of [beziers] that belong to finished strokes, as an immutable copy. It's replaced
+    // only when the finished strokes change, so the pad can cache them and redraw just the stroke in
+    // progress on each move.
+    private val finished = mutableStateOf(Signature.Empty)
+    override val signature: Signature get() = finished.value
+
     // Whether the next curve starts a new stroke. It does after a gesture starts, and after anything
     // else that discards the points of the stroke in progress.
     private var nextCurveStartsStroke = true
@@ -82,14 +89,8 @@ public class SignaturePadStateImpl(
     // nothing to draw from.
     private var lastGesturePoint: Offset? = null
 
-    // The number of curves at the end of [beziers] that belong to the stroke in progress. The ones
-    // before them are finished, and only change when a stroke ends or the whole signature changes, so
-    // the pad can cache them and redraw just the stroke in progress on each move.
-    private var strokeCurveCount = 0
-
-    // Changes whenever the finished curves do. Read by drawFinishedStrokes so that the pad knows when
-    // to redraw its cache.
-    private val finishedStrokesVersion = mutableIntStateOf(0)
+    // The curves at the end of [beziers] that belong to the stroke in progress, after the finished ones.
+    private val strokeCurveCount: Int get() = beziers.size - finished.value.curves.size
 
     private var width: Int = 0
     private var height: Int = 0
@@ -109,7 +110,8 @@ public class SignaturePadStateImpl(
         gestureActive = true
         // Usually the last stroke has ended and there's no stroke in progress, so the finished
         // strokes don't change and the pad's cache of them stays valid.
-        resetStroke(finishedStrokesChanged = strokeCurveCount > 0)
+        if (strokeCurveCount > 0) publishFinished()
+        resetStroke()
         dragTo(point)
     }
 
@@ -181,7 +183,6 @@ public class SignaturePadStateImpl(
 
             val bezier = Bezier(startPoint, endPoint, prevPoint, nextPoint, nextCurveStartsStroke)
             beziers.add(bezier)
-            strokeCurveCount++
             nextCurveStartsStroke = false
 
             // Remove the first point
@@ -205,17 +206,22 @@ public class SignaturePadStateImpl(
             val (startPoint, endPoint) = points
             beziers.add(Bezier(startPoint, endPoint, startPoint, endPoint, nextCurveStartsStroke))
         }
+        // A stroke that drew nothing, off the pad say, leaves the finished strokes as they are.
+        if (strokeCurveCount > 0) publishFinished()
         resetStroke()
     }
 
-    // Ends the stroke in progress, which makes its curves part of the finished ones. Everything that
-    // changes the finished curves (ending a stroke, clearing, resizing, restoring) goes through here.
-    private fun resetStroke(finishedStrokesChanged: Boolean = true) {
+    // Drops the points of the stroke in progress, so the next move starts a new stroke.
+    private fun resetStroke() {
         points.clear()
         nextCurveStartsStroke = true
         lastGesturePoint = null
-        strokeCurveCount = 0
-        if (finishedStrokesChanged) finishedStrokesVersion.intValue++
+    }
+
+    // Makes every curve so far part of the finished strokes. Everything that changes them (ending a
+    // stroke, clearing, resizing, restoring) goes through here.
+    private fun publishFinished() {
+        finished.value = Signature(beziers.toList(), width, height)
     }
 
     override fun drawSignature(canvas: Canvas, penColor: Color, penWidth: Float) {
@@ -227,18 +233,13 @@ public class SignaturePadStateImpl(
      * that affect them, so a cache drawn with this stays valid while a stroke is being drawn.
      */
     internal fun drawFinishedStrokes(canvas: Canvas, penColor: Color, penWidth: Float) {
-        finishedStrokesVersion.intValue
-        Snapshot.withoutReadObservation {
-            val finished = beziers.subList(0, beziers.size - strokeCurveCount)
-            drawCurves(canvas, finished, penPaint(penColor, penWidth))
-        }
+        drawCurves(canvas, finished.value.curves, penPaint(penColor, penWidth))
     }
 
     /** Draws the stroke in progress, the part of the signature that [drawFinishedStrokes] leaves out. */
     internal fun drawStrokeInProgress(canvas: Canvas, penColor: Color, penWidth: Float) {
-        // Reading the version redraws this when a stroke ends and moves to the finished ones.
-        finishedStrokesVersion.intValue
-        val stroke = beziers.subList(beziers.size - strokeCurveCount, beziers.size)
+        // Reading the finished strokes redraws this when a stroke ends and moves to them.
+        val stroke = beziers.subList(finished.value.curves.size, beziers.size)
         drawCurves(canvas, stroke, penPaint(penColor, penWidth))
     }
 
@@ -273,6 +274,7 @@ public class SignaturePadStateImpl(
         beziers.clear()
         beziers.addAll(remapped)
         remappedCount = beziers.size
+        if (beziers.isNotEmpty()) publishFinished()
     }
 
     override fun clear() {
@@ -281,6 +283,7 @@ public class SignaturePadStateImpl(
         resetStroke()
         beziers.clear()
         resetRemapSource()
+        if (!finished.value.isEmpty) publishFinished()
     }
 
     private fun resetRemapSource() {
@@ -334,6 +337,7 @@ public class SignaturePadStateImpl(
             )
             i += FLOATS_PER_BEZIER
         }
+        publishFinished()
     }
 
     override fun drawOnBitmap(
@@ -341,22 +345,7 @@ public class SignaturePadStateImpl(
         penColor: Color,
         penWidth: Float,
     ) {
-        val scaling = min(bitmap.width / width.toFloat(), bitmap.height / height.toFloat())
-        drawCurves(Canvas(bitmap), beziers.map { it.scale(scaling) }, penPaint(penColor, penWidth))
-    }
-
-    private fun drawCurves(canvas: Canvas, curves: List<Bezier>, paint: Paint) {
-        if (curves.isEmpty()) return
-        canvas.drawPath(pathOf(curves), paint)
-    }
-
-    private fun penPaint(color: Color, width: Float) = Paint().apply {
-        this.color = color
-        style = PaintingStyle.Stroke
-        strokeWidth = width
-        // Round ends and corners, so strokes look like they were drawn with a round pen.
-        strokeCap = StrokeCap.Round
-        strokeJoin = StrokeJoin.Round
+        Signature(beziers, width, height).drawOnBitmap(bitmap, penColor, penWidth)
     }
 
     private companion object {
